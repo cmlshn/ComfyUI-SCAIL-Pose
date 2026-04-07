@@ -198,7 +198,8 @@ class PoseDetectionVitPoseToDWPose:
         for img in tqdm(images_np, total=len(images_np), desc="Detecting bboxes"):
             detections = detector(
                 cv2.resize(img, (640, 640)).transpose(2, 0, 1)[None],
-                shape
+                shape,
+                single_person=False
                 )[0]
             frame_bboxes = []
             for det in detections:

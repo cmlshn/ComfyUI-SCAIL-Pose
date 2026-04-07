@@ -142,6 +142,22 @@ def scale_faces(poses, pose_2d_ref):
 
     return scale_n
 
+def merge_dwpose_results(person_dwposes):
+    """Merge multiple single-person DWPose dicts into one multi-person dict."""
+    if len(person_dwposes) == 1:
+        return person_dwposes[0]
+    return {
+        "bodies": {
+            "candidate": np.concatenate([p["bodies"]["candidate"] for p in person_dwposes], axis=0),
+            "subset": np.concatenate([p["bodies"]["subset"] for p in person_dwposes], axis=0),
+        },
+        "hands": np.concatenate([p["hands"] for p in person_dwposes], axis=0),
+        "faces": np.concatenate([p["faces"] for p in person_dwposes], axis=0),
+        "body_score": np.concatenate([p["body_score"] for p in person_dwposes], axis=0),
+        "hand_score": np.concatenate([p["hand_score"] for p in person_dwposes], axis=0),
+        "face_score": np.concatenate([p["face_score"] for p in person_dwposes], axis=0),
+    }
+
 class PoseDetectionVitPoseToDWPose:
     @classmethod
     def INPUT_TYPES(s):
@@ -177,41 +193,48 @@ class PoseDetectionVitPoseToDWPose:
 
         comfy_pbar = ProgressBar(B*2)
         progress = 0
-        bboxes = []
+
+        bboxes_per_frame = []
         for img in tqdm(images_np, total=len(images_np), desc="Detecting bboxes"):
-            bboxes.append(detector(
+            detections = detector(
                 cv2.resize(img, (640, 640)).transpose(2, 0, 1)[None],
                 shape
-                )[0][0]["bbox"])
+                )[0]
+            frame_bboxes = []
+            for det in detections:
+                bbox = det["bbox"]
+                if bbox is not None and bbox[-1] > 0 and (bbox[2] - bbox[0]) >= 10 and (bbox[3] - bbox[1]) >= 10:
+                    frame_bboxes.append(bbox)
+            if not frame_bboxes:
+                frame_bboxes = [np.array([0, 0, W, H])]
+            bboxes_per_frame.append(frame_bboxes)
             progress += 1
             if progress % 10 == 0:
                 comfy_pbar.update_absolute(progress)
 
         detector.cleanup()
 
-        kp2ds = []
-        for img, bbox in tqdm(zip(images_np, bboxes), total=len(images_np), desc="Extracting keypoints"):
-            if bbox is None or bbox[-1] <= 0 or (bbox[2] - bbox[0]) < 10 or (bbox[3] - bbox[1]) < 10:
-                bbox = np.array([0, 0, img.shape[1], img.shape[0]])
+        dwposes = []
+        for img, frame_bboxes in tqdm(zip(images_np, bboxes_per_frame), total=len(images_np), desc="Extracting keypoints"):
+            person_dwposes = []
+            for bbox in frame_bboxes:
+                center, scale = bbox_from_detector(bbox, input_resolution, rescale=rescale)
+                cropped = crop(img, center, scale, (input_resolution[0], input_resolution[1]))[0]
 
-            bbox_xywh = bbox
-            center, scale = bbox_from_detector(bbox_xywh, input_resolution, rescale=rescale)
-            img = crop(img, center, scale, (input_resolution[0], input_resolution[1]))[0]
+                img_norm = (cropped - IMG_NORM_MEAN) / IMG_NORM_STD
+                img_norm = img_norm.transpose(2, 0, 1).astype(np.float32)
 
-            img_norm = (img - IMG_NORM_MEAN) / IMG_NORM_STD
-            img_norm = img_norm.transpose(2, 0, 1).astype(np.float32)
+                keypoints = pose_model(img_norm[None], np.array(center)[None], np.array(scale)[None])
+                meta = load_pose_metas_from_kp2ds_seq(keypoints, width=W, height=H)[0]
+                person_dwposes.append(aaposemeta_to_dwpose_scail(meta))
 
-            keypoints = pose_model(img_norm[None], np.array(center)[None], np.array(scale)[None])
-            kp2ds.append(keypoints)
+            dwposes.append(merge_dwpose_results(person_dwposes))
             progress += 1
             if progress % 10 == 0:
                 comfy_pbar.update_absolute(progress)
 
         pose_model.cleanup()
 
-        kp2ds = np.concatenate(kp2ds, 0)
-        pose_metas = load_pose_metas_from_kp2ds_seq(kp2ds, width=W, height=H)
-        dwposes = [aaposemeta_to_dwpose_scail(meta) for meta in pose_metas]
         swap_hands = True
         out_dict = {"poses": dwposes, "swap_hands": swap_hands}
         return out_dict,
@@ -239,6 +262,104 @@ class ConvertOpenPoseKeypointsToDWPose:
         return out_dict,
 
 
+def filter_to_single_person(pose_input, dw_pose_input, intrinsic_matrix, height, width):
+    """Filter multi-person NLF and DWPose inputs to the main character only.
+
+    Main character = largest 3D body extent in first valid frame, tracked by pelvis proximity.
+    DWPose person is matched by projecting the NLF main person's head joint to 2D.
+    """
+    main_idx = 0
+    for frame_poses in pose_input:
+        if frame_poses.shape[0] == 0:
+            continue
+        max_extent = -1
+        for p_idx in range(frame_poses.shape[0]):
+            person = frame_poses[p_idx]
+            person_np = person.cpu().numpy() if isinstance(person, torch.Tensor) else person
+            if np.sum(np.abs(person_np)) < 0.01:
+                continue
+            extent = np.sum(np.max(person_np, axis=0) - np.min(person_np, axis=0))
+            if extent > max_extent:
+                max_extent = extent
+                main_idx = p_idx
+        break
+
+    tracked_nlf_indices = []
+    prev_pelvis = None
+    for frame_poses in pose_input:
+        if frame_poses.shape[0] == 0:
+            tracked_nlf_indices.append(0)
+            continue
+        if prev_pelvis is None:
+            tracked_idx = main_idx if main_idx < frame_poses.shape[0] else 0
+        else:
+            min_dist = float('inf')
+            tracked_idx = 0
+            for p_idx in range(frame_poses.shape[0]):
+                pelvis = frame_poses[p_idx][0]
+                pelvis_np = pelvis.cpu().numpy() if isinstance(pelvis, torch.Tensor) else pelvis
+                dist = np.linalg.norm(pelvis_np - prev_pelvis)
+                if dist < min_dist:
+                    min_dist = dist
+                    tracked_idx = p_idx
+        tracked_nlf_indices.append(tracked_idx)
+        pelvis = frame_poses[tracked_idx][0]
+        prev_pelvis = pelvis.cpu().numpy() if isinstance(pelvis, torch.Tensor) else pelvis
+
+    filtered_pose_input = []
+    for frame_idx, frame_poses in enumerate(pose_input):
+        t_idx = tracked_nlf_indices[frame_idx]
+        if frame_poses.shape[0] > 0 and t_idx < frame_poses.shape[0]:
+            filtered_pose_input.append(frame_poses[t_idx:t_idx+1])
+        elif frame_poses.shape[0] > 0:
+            filtered_pose_input.append(frame_poses[0:1])
+        else:
+            filtered_pose_input.append(frame_poses)
+
+    if dw_pose_input is not None:
+        fx, fy = intrinsic_matrix[0, 0], intrinsic_matrix[1, 1]
+        cx, cy = intrinsic_matrix[0, 2], intrinsic_matrix[1, 2]
+
+        for frame_idx, frame_dw in enumerate(dw_pose_input):
+            num_dw_people = frame_dw['bodies']['candidate'].shape[0]
+            if num_dw_people <= 1:
+                continue
+
+            nlf_frame = filtered_pose_input[frame_idx]
+            best_dw_idx = 0
+
+            if nlf_frame.shape[0] > 0:
+                neck = nlf_frame[0][15]
+                neck_np = neck.cpu().numpy() if isinstance(neck, torch.Tensor) else neck
+                if np.sum(np.abs(neck_np)) > 0.01 and neck_np[2] > 0.01:
+                    u = (fx * neck_np[0] / neck_np[2] + cx) / width
+                    v = (fy * neck_np[1] / neck_np[2] + cy) / height
+                    neck_2d = np.array([u, v])
+
+                    min_dist = float('inf')
+                    for dw_p_idx in range(num_dw_people):
+                        dw_body = frame_dw['bodies']['candidate'][dw_p_idx]
+                        valid = np.any(dw_body != 0, axis=1)
+                        dw_center = np.mean(dw_body[valid], axis=0) if np.any(valid) else np.mean(dw_body, axis=0)
+                        dist = np.linalg.norm(neck_2d - dw_center)
+                        if dist < min_dist:
+                            min_dist = dist
+                            best_dw_idx = dw_p_idx
+
+            p = best_dw_idx
+            frame_dw['bodies']['candidate'] = frame_dw['bodies']['candidate'][p:p+1]
+            frame_dw['bodies']['subset'] = frame_dw['bodies']['subset'][p:p+1]
+            frame_dw['hands'] = frame_dw['hands'][2*p:2*p+2]
+            frame_dw['faces'] = frame_dw['faces'][p:p+1]
+            if 'body_score' in frame_dw:
+                frame_dw['body_score'] = frame_dw['body_score'][p:p+1]
+            if 'hand_score' in frame_dw:
+                frame_dw['hand_score'] = frame_dw['hand_score'][2*p:2*p+2]
+            if 'face_score' in frame_dw:
+                frame_dw['face_score'] = frame_dw['face_score'][p:p+1]
+
+    return filtered_pose_input, dw_pose_input
+
 class RenderNLFPoses:
     @classmethod
     def INPUT_TYPES(s):
@@ -255,6 +376,7 @@ class RenderNLFPoses:
                 "render_device": (["gpu", "cpu", "opengl", "cuda", "vulkan", "metal"], {"default": "gpu", "tooltip": "Taichi device to use for rendering"}),
                 "scale_hands": ("BOOLEAN", {"default": True, "tooltip": "Whether to scale hand keypoints when aligning DW poses"}),
                 "render_backend": (["taichi", "torch"], {"default": "taichi", "tooltip": "Rendering backend to use"}),
+                "single_person": ("BOOLEAN", {"default": False, "tooltip": "When True, select the main character from NLF (largest 3D body in first frame) and filter both NLF and DWPose to that one person."}),
             }
     }
 
@@ -263,7 +385,7 @@ class RenderNLFPoses:
     FUNCTION = "predict"
     CATEGORY = "WanVideoWrapper"
 
-    def predict(self, nlf_poses, width, height, dw_poses=None, ref_dw_pose=None, draw_face=True, draw_hands=True, render_device="gpu", scale_hands=True, render_backend="taichi"):
+    def predict(self, nlf_poses, width, height, dw_poses=None, ref_dw_pose=None, draw_face=True, draw_hands=True, render_device="gpu", scale_hands=True, render_backend="taichi", single_person=False):
 
         from .NLFPoseExtract.nlf_render import render_nlf_as_images, render_multi_nlf_as_images, shift_dwpose_according_to_nlf, process_data_to_COCO_format, intrinsic_matrix_from_field_of_view
         from .NLFPoseExtract.align3d import solve_new_camera_params_central, solve_new_camera_params_down
@@ -294,7 +416,10 @@ class RenderNLFPoses:
         ori_camera_pose = intrinsic_matrix_from_field_of_view([height, width])
         ori_focal = ori_camera_pose[0, 0]
 
-        num_people = dw_pose_input[0]['bodies']['candidate'].shape[0] if dw_poses is not None else 0
+        if single_person:
+            pose_input, dw_pose_input = filter_to_single_person(pose_input, dw_pose_input, ori_camera_pose, height, width)
+
+        num_people = dw_pose_input[0]['bodies']['candidate'].shape[0] if dw_pose_input is not None else 0
 
         if dw_poses is not None and ref_dw_pose is not None and num_people == 1:
             ref_dw_pose_input = copy.deepcopy(ref_dw_pose["poses"])

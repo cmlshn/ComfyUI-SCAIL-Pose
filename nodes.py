@@ -263,49 +263,124 @@ class ConvertOpenPoseKeypointsToDWPose:
         return out_dict,
 
 
-def filter_to_single_person(pose_input, dw_pose_input, intrinsic_matrix, height, width):
+def filter_to_single_person(pose_input, dw_pose_input, intrinsic_matrix, height, width, debug_lines=None):
     """Filter multi-person NLF and DWPose inputs to the main character only.
 
     Main character = largest 3D body extent in first valid frame, tracked by pelvis proximity.
     DWPose person is matched by projecting the NLF main person's head joint to 2D.
     """
+    fx, fy = intrinsic_matrix[0, 0], intrinsic_matrix[1, 1]
+    cx, cy = intrinsic_matrix[0, 2], intrinsic_matrix[1, 2]
+
+    if debug_lines is not None:
+        debug_lines.append("=== FILTER_TO_SINGLE_PERSON ===")
+        debug_lines.append(f"intrinsic_matrix: fx={fx:.2f}, fy={fy:.2f}, cx={cx:.2f}, cy={cy:.2f}")
+        debug_lines.append(f"image size: {width}x{height}")
+        debug_lines.append(f"total NLF frames: {len(pose_input)}")
+        debug_lines.append(f"total DW frames: {len(dw_pose_input) if dw_pose_input else 'None'}")
+        debug_lines.append("")
+
     main_idx = 0
     for frame_poses in pose_input:
         if frame_poses.shape[0] == 0:
             continue
+
+        if debug_lines is not None:
+            debug_lines.append(f"--- Person Selection (first valid frame) ---")
+            debug_lines.append(f"NLF people detected: {frame_poses.shape[0]}")
+
         max_extent = -1
         for p_idx in range(frame_poses.shape[0]):
             person = frame_poses[p_idx]
             person_np = person.cpu().numpy() if isinstance(person, torch.Tensor) else person
+
+            if debug_lines is not None:
+                pelvis = person_np[0]
+                mean_z = np.mean(person_np[:, 2])
+                extent_3d = np.sum(np.max(person_np, axis=0) - np.min(person_np, axis=0))
+                valid_z = person_np[:, 2] > 0.01
+                if np.any(valid_z):
+                    pts = person_np[valid_z]
+                    u_pts = (fx * pts[:, 0] / pts[:, 2] + cx) / width
+                    v_pts = (fy * pts[:, 1] / pts[:, 2] + cy) / height
+                    area_2d = (np.max(u_pts) - np.min(u_pts)) * (np.max(v_pts) - np.min(v_pts))
+                    u_range = f"[{np.min(u_pts):.4f}, {np.max(u_pts):.4f}]"
+                    v_range = f"[{np.min(v_pts):.4f}, {np.max(v_pts):.4f}]"
+                else:
+                    area_2d = 0.0
+                    u_range = "N/A"
+                    v_range = "N/A"
+                debug_lines.append(
+                    f"  Person {p_idx}: pelvis=({pelvis[0]:.1f}, {pelvis[1]:.1f}, {pelvis[2]:.1f}), "
+                    f"mean_Z={mean_z:.1f}, 3D_extent={extent_3d:.1f}, "
+                    f"2D_area={area_2d:.6f}, u_range={u_range}, v_range={v_range}"
+                )
+
             if np.sum(np.abs(person_np)) < 0.01:
+                if debug_lines is not None:
+                    debug_lines.append(f"    -> SKIPPED (near-zero joints)")
                 continue
             extent = np.sum(np.max(person_np, axis=0) - np.min(person_np, axis=0))
             if extent > max_extent:
                 max_extent = extent
                 main_idx = p_idx
+        if debug_lines is not None:
+            debug_lines.append(f"  >> Selected main_idx={main_idx} (3D_extent={max_extent:.1f})")
+            debug_lines.append("")
         break
 
     tracked_nlf_indices = []
     prev_pelvis = None
-    for frame_poses in pose_input:
+    prev_tracked_idx = None
+
+    if debug_lines is not None:
+        debug_lines.append("--- Per-Frame Tracking ---")
+
+    for frame_idx, frame_poses in enumerate(pose_input):
         if frame_poses.shape[0] == 0:
             tracked_nlf_indices.append(0)
+            if debug_lines is not None:
+                debug_lines.append(f"Frame {frame_idx}: 0 people, tracked_idx=0 (empty)")
             continue
         if prev_pelvis is None:
             tracked_idx = main_idx if main_idx < frame_poses.shape[0] else 0
+            if debug_lines is not None:
+                pelvis = frame_poses[tracked_idx][0]
+                p_np = pelvis.cpu().numpy() if isinstance(pelvis, torch.Tensor) else pelvis
+                debug_lines.append(
+                    f"Frame {frame_idx}: {frame_poses.shape[0]} people, tracked_idx={tracked_idx} (initial=main_idx), "
+                    f"pelvis=({p_np[0]:.1f}, {p_np[1]:.1f}, {p_np[2]:.1f})"
+                )
         else:
             min_dist = float('inf')
             tracked_idx = 0
+            all_dists = []
             for p_idx in range(frame_poses.shape[0]):
                 pelvis = frame_poses[p_idx][0]
                 pelvis_np = pelvis.cpu().numpy() if isinstance(pelvis, torch.Tensor) else pelvis
                 dist = np.linalg.norm(pelvis_np - prev_pelvis)
+                all_dists.append((p_idx, dist, pelvis_np.copy()))
                 if dist < min_dist:
                     min_dist = dist
                     tracked_idx = p_idx
+            if debug_lines is not None:
+                changed = "CHANGED" if prev_tracked_idx is not None and tracked_idx != prev_tracked_idx else "same"
+                p_np = all_dists[tracked_idx][2]
+                debug_lines.append(
+                    f"Frame {frame_idx}: {frame_poses.shape[0]} people, tracked_idx={tracked_idx} ({changed}), "
+                    f"dist={min_dist:.1f}, pelvis=({p_np[0]:.1f}, {p_np[1]:.1f}, {p_np[2]:.1f})"
+                )
+                if frame_poses.shape[0] > 1 and frame_idx < 5:
+                    for pi, di, pv in all_dists:
+                        debug_lines.append(f"    candidate {pi}: dist={di:.1f}, pelvis=({pv[0]:.1f}, {pv[1]:.1f}, {pv[2]:.1f})")
+
         tracked_nlf_indices.append(tracked_idx)
         pelvis = frame_poses[tracked_idx][0]
         prev_pelvis = pelvis.cpu().numpy() if isinstance(pelvis, torch.Tensor) else pelvis
+        prev_tracked_idx = tracked_idx
+
+    if debug_lines is not None:
+        debug_lines.append("")
 
     filtered_pose_input = []
     for frame_idx, frame_poses in enumerate(pose_input):
@@ -318,16 +393,21 @@ def filter_to_single_person(pose_input, dw_pose_input, intrinsic_matrix, height,
             filtered_pose_input.append(frame_poses)
 
     if dw_pose_input is not None:
-        fx, fy = intrinsic_matrix[0, 0], intrinsic_matrix[1, 1]
-        cx, cy = intrinsic_matrix[0, 2], intrinsic_matrix[1, 2]
+        if debug_lines is not None:
+            debug_lines.append("--- DWPose Matching ---")
 
         for frame_idx, frame_dw in enumerate(dw_pose_input):
             num_dw_people = frame_dw['bodies']['candidate'].shape[0]
             if num_dw_people <= 1:
+                if debug_lines is not None and frame_idx < 3:
+                    debug_lines.append(f"Frame {frame_idx}: {num_dw_people} DW people, skipped (<=1)")
                 continue
 
             nlf_frame = filtered_pose_input[frame_idx]
             best_dw_idx = 0
+
+            if debug_lines is not None:
+                debug_lines.append(f"Frame {frame_idx}: {num_dw_people} DW people")
 
             if nlf_frame.shape[0] > 0:
                 neck = nlf_frame[0][15]
@@ -337,15 +417,25 @@ def filter_to_single_person(pose_input, dw_pose_input, intrinsic_matrix, height,
                     v = (fy * neck_np[1] / neck_np[2] + cy) / height
                     neck_2d = np.array([u, v])
 
+                    if debug_lines is not None:
+                        debug_lines.append(f"  NLF neck 3D=({neck_np[0]:.1f}, {neck_np[1]:.1f}, {neck_np[2]:.1f}) -> 2D=({u:.4f}, {v:.4f})")
+
                     min_dist = float('inf')
                     for dw_p_idx in range(num_dw_people):
                         dw_body = frame_dw['bodies']['candidate'][dw_p_idx]
                         valid = np.any(dw_body != 0, axis=1)
                         dw_center = np.mean(dw_body[valid], axis=0) if np.any(valid) else np.mean(dw_body, axis=0)
                         dist = np.linalg.norm(neck_2d - dw_center)
+                        if debug_lines is not None:
+                            debug_lines.append(f"  DW person {dw_p_idx} center=({dw_center[0]:.4f}, {dw_center[1]:.4f}), dist={dist:.4f}")
                         if dist < min_dist:
                             min_dist = dist
                             best_dw_idx = dw_p_idx
+
+                    if debug_lines is not None:
+                        debug_lines.append(f"  >> Matched DW person {best_dw_idx}")
+                elif debug_lines is not None:
+                    debug_lines.append(f"  NLF neck invalid (near-zero or Z<=0), defaulting to DW person 0")
 
             p = best_dw_idx
             frame_dw['bodies']['candidate'] = frame_dw['bodies']['candidate'][p:p+1]
@@ -358,6 +448,9 @@ def filter_to_single_person(pose_input, dw_pose_input, intrinsic_matrix, height,
                 frame_dw['hand_score'] = frame_dw['hand_score'][2*p:2*p+2]
             if 'face_score' in frame_dw:
                 frame_dw['face_score'] = frame_dw['face_score'][p:p+1]
+
+        if debug_lines is not None:
+            debug_lines.append("")
 
     return filtered_pose_input, dw_pose_input
 
@@ -417,15 +510,23 @@ class RenderNLFPoses:
         ori_camera_pose = intrinsic_matrix_from_field_of_view([height, width])
         ori_focal = ori_camera_pose[0, 0]
 
+        debug_lines = [] if single_person else None
+
         if single_person:
-            pose_input, dw_pose_input = filter_to_single_person(pose_input, dw_pose_input, ori_camera_pose, height, width)
+            pose_input, dw_pose_input = filter_to_single_person(pose_input, dw_pose_input, ori_camera_pose, height, width, debug_lines=debug_lines)
 
         num_people = dw_pose_input[0]['bodies']['candidate'].shape[0] if dw_pose_input is not None else 0
+
+        if debug_lines is not None:
+            debug_lines.append("=== CAMERA ALIGNMENT ===")
+            debug_lines.append(f"num_people after filter: {num_people}")
+            debug_lines.append(f"ori_focal: {ori_focal:.2f}")
+            debug_lines.append(f"ori_camera_pose:\n{ori_camera_pose}")
+            debug_lines.append("")
 
         if dw_poses is not None and ref_dw_pose is not None and num_people == 1:
             ref_dw_pose_input = copy.deepcopy(ref_dw_pose["poses"])
 
-            # Find the first valid pose
             pose_3d_first_driving_frame = None
             for pose in pose_input:
                 if pose.shape[0] == 0:
@@ -437,10 +538,24 @@ class RenderNLFPoses:
             if pose_3d_first_driving_frame is None:
                 raise ValueError("No valid pose found in pose_input.")
 
+            if debug_lines is not None:
+                pelvis_3d = pose_3d_first_driving_frame[0]
+                debug_lines.append(f"First driving 3D pose (24 joints):")
+                debug_lines.append(f"  pelvis (joint 0): ({pelvis_3d[0]:.1f}, {pelvis_3d[1]:.1f}, {pelvis_3d[2]:.1f})")
+                debug_lines.append(f"  neck (joint 1): ({pose_3d_first_driving_frame[1][0]:.1f}, {pose_3d_first_driving_frame[1][1]:.1f}, {pose_3d_first_driving_frame[1][2]:.1f})")
+                debug_lines.append(f"  head (joint 15): ({pose_3d_first_driving_frame[15][0]:.1f}, {pose_3d_first_driving_frame[15][1]:.1f}, {pose_3d_first_driving_frame[15][2]:.1f})")
+                debug_lines.append("")
+
             pose_3d_coco_first_driving_frame = process_data_to_COCO_format(pose_3d_first_driving_frame)
             poses_2d_ref = ref_dw_pose_input[0]['bodies']['candidate'][0][:14]
             poses_2d_ref[:, 0] = poses_2d_ref[:, 0] * width
             poses_2d_ref[:, 1] = poses_2d_ref[:, 1] * height
+
+            if debug_lines is not None:
+                debug_lines.append(f"ref_dw_pose 2D (pixel coords, first 14 joints):")
+                for ji in range(min(14, len(poses_2d_ref))):
+                    debug_lines.append(f"  joint {ji}: ({poses_2d_ref[ji][0]:.1f}, {poses_2d_ref[ji][1]:.1f})")
+                debug_lines.append("")
 
             poses_2d_subset = ref_dw_pose_input[0]['bodies']['subset'][0][:14]
             pose_3d_coco_first_driving_frame = pose_3d_coco_first_driving_frame[:14]
@@ -458,8 +573,24 @@ class RenderNLFPoses:
 
             valid_indices = [1] + valid_lower_indices if len(valid_upper_indices) < 4 else [1] + valid_lower_indices + valid_upper_indices # align body or only lower body
 
+            if debug_lines is not None:
+                debug_lines.append(f"valid_upper_indices: {valid_upper_indices}")
+                debug_lines.append(f"valid_lower_indices: {valid_lower_indices}")
+                debug_lines.append(f"valid_indices (used for alignment): {valid_indices}")
+                solver_name = "solve_new_camera_params_down" if len(valid_lower_indices) >= 4 else "solve_new_camera_params_central"
+                debug_lines.append(f"solver: {solver_name}")
+                debug_lines.append("")
+
             pose_2d_ref = poses_2d_ref[valid_indices]
             pose_3d_coco_first_driving_frame = pose_3d_coco_first_driving_frame[valid_indices]
+
+            if debug_lines is not None:
+                debug_lines.append(f"Alignment input - 3D COCO joints (selected):")
+                for i, vi in enumerate(valid_indices):
+                    j3 = pose_3d_coco_first_driving_frame[i]
+                    j2 = pose_2d_ref[i]
+                    debug_lines.append(f"  idx {vi}: 3D=({j3[0]:.1f}, {j3[1]:.1f}, {j3[2]:.1f}) <-> 2D=({j2[0]:.1f}, {j2[1]:.1f})")
+                debug_lines.append("")
 
             if len(valid_lower_indices) >= 4:
                 new_camera_intrinsics, scale_m, scale_s = solve_new_camera_params_down(pose_3d_coco_first_driving_frame, ori_focal, [height, width], pose_2d_ref)
@@ -468,17 +599,46 @@ class RenderNLFPoses:
 
             scale_face = scale_faces(list(dw_pose_input), list(ref_dw_pose_input))   # poses[0]['faces'].shape: 1, 68, 2  , poses_ref[0]['faces'].shape: 1, 68, 2
 
+            if debug_lines is not None:
+                debug_lines.append(f"--- Solver Output ---")
+                debug_lines.append(f"scale_m: {scale_m}")
+                debug_lines.append(f"scale_s: {scale_s}")
+                debug_lines.append(f"scale_face: {scale_face}")
+                debug_lines.append(f"new_camera_intrinsics:\n{new_camera_intrinsics}")
+                debug_lines.append("")
+
             logging.info(f"Scale - m: {scale_m}, face: {scale_face}")
             shift_dwpose_according_to_nlf(pose_input, dw_pose_input, ori_camera_pose, new_camera_intrinsics, height, width, swap_hands=swap_hands, scale_hands=scale_hands, scale_x=scale_m, scale_y=scale_m*scale_s)
 
             intrinsic_matrix = new_camera_intrinsics
         else:
             intrinsic_matrix = ori_camera_pose
+            if debug_lines is not None:
+                debug_lines.append("Skipped camera alignment (no ref_dw_pose or num_people != 1)")
+                debug_lines.append("")
+
+        render_fn = "render_multi_nlf_as_images" if pose_input[0].shape[0] > 1 else "render_nlf_as_images"
+        if debug_lines is not None:
+            debug_lines.append("=== RENDERING ===")
+            debug_lines.append(f"render function: {render_fn}")
+            debug_lines.append(f"final intrinsic_matrix:\n{intrinsic_matrix}")
+            debug_lines.append(f"total frames: {len(pose_input)}")
+            debug_lines.append("")
 
         if pose_input[0].shape[0] > 1:
             frames_np = render_multi_nlf_as_images(pose_input, dw_pose_input, height, width, len(pose_input), intrinsic_matrix=intrinsic_matrix, draw_face=draw_face, draw_hands=draw_hands, render_backend = render_backend)
         else:
             frames_np = render_nlf_as_images(pose_input, dw_pose_input, height, width, len(pose_input), intrinsic_matrix=intrinsic_matrix, draw_face=draw_face, draw_hands=draw_hands, render_backend = render_backend)
+
+        if debug_lines is not None:
+            try:
+                output_dir = folder_paths.get_output_directory()
+                debug_path = os.path.join(output_dir, "debug_single_person.txt")
+                with open(debug_path, "w") as f:
+                    f.write("\n".join(debug_lines))
+                logging.info(f"Debug log written to {debug_path}")
+            except Exception as e:
+                logging.error(f"Failed to write debug log: {e}")
 
         frames_tensor = torch.from_numpy(np.stack(frames_np, axis=0)).contiguous() / 255.0
         frames_tensor, mask = frames_tensor[..., :3], frames_tensor[..., -1] > 0.5

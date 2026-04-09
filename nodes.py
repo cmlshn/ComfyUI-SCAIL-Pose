@@ -266,22 +266,31 @@ class ConvertOpenPoseKeypointsToDWPose:
 def filter_to_single_person(pose_input, dw_pose_input, intrinsic_matrix, height, width):
     """Filter multi-person NLF and DWPose inputs to the main character only.
 
-    Main character = largest 3D body extent in first valid frame, tracked by pelvis proximity.
+    Main character = largest projected 2D bounding box in first valid frame, tracked by pelvis proximity.
     DWPose person is matched by projecting the NLF main person's head joint to 2D.
     """
+    fx, fy = intrinsic_matrix[0, 0], intrinsic_matrix[1, 1]
+    cx, cy = intrinsic_matrix[0, 2], intrinsic_matrix[1, 2]
+
     main_idx = 0
     for frame_poses in pose_input:
         if frame_poses.shape[0] == 0:
             continue
-        max_extent = -1
+        max_area = -1
         for p_idx in range(frame_poses.shape[0]):
             person = frame_poses[p_idx]
             person_np = person.cpu().numpy() if isinstance(person, torch.Tensor) else person
             if np.sum(np.abs(person_np)) < 0.01:
                 continue
-            extent = np.sum(np.max(person_np, axis=0) - np.min(person_np, axis=0))
-            if extent > max_extent:
-                max_extent = extent
+            valid = person_np[:, 2] > 0.01
+            if not np.any(valid):
+                continue
+            pts = person_np[valid]
+            u = (fx * pts[:, 0] / pts[:, 2] + cx) / width
+            v = (fy * pts[:, 1] / pts[:, 2] + cy) / height
+            area = (np.max(u) - np.min(u)) * (np.max(v) - np.min(v))
+            if area > max_area:
+                max_area = area
                 main_idx = p_idx
         break
 
@@ -318,9 +327,6 @@ def filter_to_single_person(pose_input, dw_pose_input, intrinsic_matrix, height,
             filtered_pose_input.append(frame_poses)
 
     if dw_pose_input is not None:
-        fx, fy = intrinsic_matrix[0, 0], intrinsic_matrix[1, 1]
-        cx, cy = intrinsic_matrix[0, 2], intrinsic_matrix[1, 2]
-
         for frame_idx, frame_dw in enumerate(dw_pose_input):
             num_dw_people = frame_dw['bodies']['candidate'].shape[0]
             if num_dw_people <= 1:
